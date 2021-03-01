@@ -19,3 +19,4 @@ conda create --name new_env -c astra-toolbox/label/dev astra-toolbox=1.9.9
 conda activate new_env
 conda install numba jupyter scikit-image
 ```
+Note that the first time the module is imported it will write a new file called `_bin.py` containing a few bits of relatively high performance code. If for some reason this fails, try it on a different machine then copy the file back to the first machine.
