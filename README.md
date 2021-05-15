@@ -20,3 +20,6 @@ conda activate new_env
 conda install numba jupyter scikit-image
 ```
 Note that the first time the module is imported it will write a new file called `_bin.py` containing a few bits of relatively high performance code. If for some reason this fails, try it on a different machine then copy the file back to the first machine.
+
+## Testing
+The supplementary module `test_RTR.py` provides very basic testing for `RegTomoRecon.py`, requiring the `pytest` package to be installed.

@@ -3,8 +3,7 @@ Created on 25 Oct 2018
 
 @author: Rob Tovey
 '''
-from numpy import ndarray, ascontiguousarray, transpose, array, pi, empty, prod, \
-    zeros, inf, maximum, minimum, logical_not, logical_or, random, isscalar
+import numpy as np
 from numpy.linalg import norm
 from scipy.sparse import dia_matrix
 from scipy.sparse.linalg import LinearOperator
@@ -12,25 +11,18 @@ from scipy.sparse.linalg import LinearOperator
 # I think _GPU=True compiles but is un-tested.
 _GPU = False
 
-for i in range(3):
-    for j in range(2):
-        end = str(i + 1) + '_' + str(j)
-        exec('_g' + end + ' = None')
-        exec('_gt' + end + ' = None')
-        exec('_g2' + end + ' = None')
-        exec('_g2t' + end + ' = None')
 try:
     import numba
 
     @numba.jit(nopython=True, parallel=True, fastmath=True)
-    def shrink(y, scale, out):
+    def project(y, scale, out):
         '''
         out[i] = min(1, scale/|y[i]|) * y[i]
         '''
         for i in numba.prange(y.shape[0]):
             n = 0
             for j in range(y.shape[1]):
-                n += y[i, j] * y[i, j] # n = |y[i]|^2
+                n += y[i, j] * y[i, j]  # n = |y[i]|^2
             if n < scale ** 2:
                 for j in range(y.shape[1]):
                     out[i, j] = y[i, j]
@@ -42,7 +34,7 @@ try:
     @numba.jit(nopython=True, parallel=True, fastmath=True)
     def sym(A, B):
         '''
-        B[i,j,J] = A[i,J,j]
+        B[i,j,J] = .5(A[i,j,J]+A[i,J,j])
         '''
         for i in numba.prange(A.shape[0]):
             for j0 in range(A.shape[1]):
@@ -58,13 +50,19 @@ try:
         func = ''
         old = (None,) * dim
         for block in product(*((options,) * dim)):
-            stepdown, first = False, True
-            for i in range(dim):
-                if block[i] == old[i]:
+            # if options = (0,1,2), dim=2, then block = (0,0), (0,1), (0,2), (1,0),...
+            stepdown = 0  # number of tabs which need to be subtracted at the end of the block
+            first = True  # only the first loop is parallelised
+            for i in range(dim):  # Naive loop over spectral dimension
+                if block[i] == old[i]:  # action can be commented out
                     func += '#'
-                if block[i] == 0:
+
+                if block[i] == 0:  # var[i] = 0 is fixed for this block
                     func += '\t' * tab + var[i] + ' = 0\n'
-                elif block[i] == 1:
+                elif block[i] == 2:  # var[i] = -1 is fixed for this block
+                    func += '\t' * tab + \
+                        var[i] + ' = ' + end[i] + '\n'
+                elif block[i] == 1:  # var[i] loops in this block
                     if block[i] == old[i]:
                         func += '\t' * tab + var[i] + ' is looping\n'
                     else:
@@ -72,30 +70,29 @@ try:
                                  ('numba.prange(' if first else 'range(') +
                                  ('1' if options[0] == 0 else '0') + ', ' + end[i] + '):\n')
                         tab += 1
-                    stepdown = all(j == 2 for j in block[i + 1:])
+                    stepdown += all(j == options[-1] for j in block[i + 1:])
                     first = False
                 else:
-                    func += '\t' * tab + \
-                        var[i] + ' = ' + end[i] + '\n'
+                    raise ValueError
 
-            for i in range(dim, Dim):
+            for i in range(dim, Dim):  # Naive loop over spectral dimensions
                 func += ('\t' * tab + 'for ' +
                          var[i] + ' in range(' + end[i] + '):\n')
                 tab += 1
 
-            # Print actual computations
+            # Print actual computations (loop body)
             for i in range(dim):
                 func += '\t' * tab + lines[block[i]][i] + '\n'
 
             tab -= (Dim - dim)
             if stepdown:
-                tab -= 1
+                tab -= stepdown
             old = tuple(b for b in block)
             func += '\n'
         return func
-        
-    # The following functions write a module with highly optimised code for 
-    # computing gradients etc. 
+
+    # The following functions write a module with highly optimised code for
+    # computing gradients etc.
 
     def genbody_GPU(lines, var, end, tab, dim, options):
         isPad = len(var) - dim  # either 1 or 0
@@ -119,7 +116,7 @@ try:
                     func += '\t' * tab + 'if ' + var[i] + '== 0:\n'
                 elif j == 2:
                     func += ('\t' * tab + ('el' if 0 in options else '')
-                             + 'if ' + var[i] + ' == ' + end[i] + ':\n')
+                             +'if ' + var[i] + ' == ' + end[i] + ':\n')
                 else:
                     func += ('\t' * tab + 'else:\n')
                 tab += 1
@@ -284,7 +281,6 @@ try:
 
     try:
         import _bin
-        print(' '*20)
     except Exception:
         with open('_bin.py', 'w') as f:
             if _GPU:
@@ -292,49 +288,46 @@ try:
             else:
                 print('import numba\n', file=f)
 
-            for i in range(3):
-                for j in range(2):
+            for i in range(3):  # i+1 is dimension of volume
+                for j in range(2):  # j is spectral dimension
                     print(numbastr[0] + tosig(i + 1 + j, i + 2 + j) +
                           numbastr[1] + gen_g(i + 1, j, _GPU), file=f)
-                    print('print("' + str(8 * i + 4 * j + 1) + '/24", end="\\r")', file=f)
+#                     print('print("' + str(8 * i + 4 * j + 1) + '/24", end="\\r")', file=f)
                     print(numbastr[0] + tosig(i + 2 + j, i + 1 + j) +
                           numbastr[1] + gen_gt(i + 1, j, _GPU), file=f)
-                    print('print("' + str(8 * i + 4 * j + 2) + '/24", end="\\r")', file=f)
+#                     print('print("' + str(8 * i + 4 * j + 2) + '/24", end="\\r")', file=f)
 
-                    if i != 2 or j != 1:
-                        print(numbastr[0] + tosig(i + 1 + j, i + 2 + j) +
-                              numbastr[1] + gen_g2(i + 1, j, _GPU), file=f)
-                    print('print("' + str(8 * i + 4 * j + 3) + '/24", end="\\r")', file=f)
+#                     if i != 2 or j != 1:
+                    print(numbastr[0] + tosig(i + 1 + j, i + 2 + j) +
+                          numbastr[1] + gen_g2(i + 1, j, _GPU), file=f)
+#                     print('print("' + str(8 * i + 4 * j + 3) + '/24", end="\\r")', file=f)
 
                     print(numbastr[0] + tosig(i + 2 + j, i + 1 + j) +
                           numbastr[1] + gen_g2t(i + 1, j, _GPU), file=f)
-                    print('print("' + str(8 * i + 4 * j + 4) + '/24", end="\\r")', file=f)
+#                     print('print("' + str(8 * i + 4 * j + 4) + '/24", end="\\r")', file=f)
 
         import _bin
         print('Compilation successful')
 
-    for func in dir(_bin):
-        if func[0] == '_' and func[1] != '_':
-            globals()[func] = getattr(_bin, func)
-
 except Exception:
     # numpy fall-back
-    if 'shrink' not in globals():
-        def shrink(y, scale, out):
+    if 'project' not in globals():
+        def project(y, scale, out):
             n = norm(y, 2, -1, True) + 1e-8
-            n = minimum(1, scale / n)
-            out[:, :] = y * n
+            n = np.minimum(1, scale / n)
+            out[:,:] = y * n
 c_diff = {'grad': {}, 'gradT': {}, 'grad2': {}, 'grad2T': {}, }
 for i in range(3):
     for j in range(2):
         end = str(i + 1) + '_' + str(j)
-        c_diff['grad'][end] = eval('_g' + end)
-        c_diff['gradT'][end] = eval('_gt' + end)
-        c_diff['grad2'][end] = eval('_g2' + end)
-        c_diff['grad2T'][end] = eval('_g2t' + end)
+        c_diff['grad'][end] = getattr(_bin, '_g' + end)
+        c_diff['gradT'][end] = getattr(_bin, '_gt' + end)
+        c_diff['grad2'][end] = getattr(_bin, '_g2' + end)
+        c_diff['grad2T'][end] = getattr(_bin, '_g2t' + end)
 
 
-class tomo_data(ndarray):
+# TODO: reimplement addition/multiplication etc.
+class tomo_data(np.ndarray):
     '''
     Object that behaves like a numpy array but wraps additional functionality 
     for tomography, such as reordering axes for efficient projection and 
@@ -355,7 +348,7 @@ class tomo_data(ndarray):
                         if i not in (tilt_axis, stack_dim)]
                 axes.insert(0, tilt_axis)
                 axes.insert(1, stack_dim)
-                arr = transpose(arr, axes)
+                arr = np.transpose(arr, axes)
             else:
                 # Not sure what orders to use for general tilt
                 # TODO: Full specified angles
@@ -365,9 +358,9 @@ class tomo_data(ndarray):
             # For dim=2 want axes of arr to be [angle, ...]
             axes = [i for i in range(arr.ndim) if i != stack_dim]
             axes.insert(0, stack_dim)
-            arr = transpose(arr, axes)
+            arr = np.transpose(arr, axes)
 
-        arr = ascontiguousarray(arr)
+        arr = np.ascontiguousarray(arr)
         self = super(tomo_data, cls).__new__(cls, arr.shape, dtype=arr.dtype,
                                              buffer=arr, strides=arr.strides, order='C')
 
@@ -385,10 +378,10 @@ class tomo_data(ndarray):
                         self.shape[0], self.shape[2])
 
         self.geom = geom
-        angles = array(angles)
+        angles = np.array(angles)
         if degrees:
             if angles.ndim == 1:
-                angles *= pi / 180
+                angles *= np.pi / 180
             else:
                 # TODO: Full specified angles
                 raise NotImplementedError
@@ -410,7 +403,7 @@ class tomo_data(ndarray):
 
         if backend == 'astra':
             if dim == 3:
-                vol_shape = vol_shape[1:] + vol_shape[:1]
+                vol_shape = list(vol_shape[1:]) + [vol_shape[0]]
 
             # Only ever use 'cuda' or linear/linearcone projections
             import astra
@@ -445,7 +438,7 @@ class tomo_data(ndarray):
 
         elif backend == 'skimage':
             from skimage.transform import radon, iradon
-            theta = self.angles * 180 / pi
+            theta = self.angles * 180 / np.pi
 
             def fwrd(x): return radon(x.reshape(vol_shape[-2:]), theta, True).T
 
@@ -458,11 +451,11 @@ class tomo_data(ndarray):
 
             if dim == 2:
                 op = LinearOperator(
-                    shape=(prod(self.shape), prod(vol_shape)),
+                    shape=(np.prod(self.shape), np.prod(vol_shape)),
                     matvec=fwrd, rmatvec=bwrd)
             else:
                 op = LinearOperator(
-                    shape=(prod(self.shape), prod(vol_shape)),
+                    shape=(np.prod(self.shape), np.prod(vol_shape)),
                     matvec=lambda x: _doSliceWise(
                         fwrd, x.reshape(vol_shape), self.shape, False),
                     rmatvec=lambda x: _doSliceWise(bwrd, x.reshape(self.shape), vol_shape, False))
@@ -479,12 +472,12 @@ class tomo_data(ndarray):
         return op
 
     def asarray(self):
-        return ndarray(self.shape, dtype=self.dtype,
+        return np.ndarray(self.shape, dtype=self.dtype,
                        buffer=self.data, strides=self.strides, order='C')
 
 
 def _doSliceWise(func, data, shape, inplace=False):
-    out = empty(shape, dtype=data.dtype)
+    out = np.empty(shape, dtype=data.dtype)
     if inplace:
         for i in range(shape[0]):
             func(data[i], out[i])
@@ -493,20 +486,22 @@ def _doSliceWise(func, data, shape, inplace=False):
             out[i] = func(data[i])
     return out
 
+
 def _timelen(t):
     '''
     Converts length of time to a reasonable string depending on scale of time
     '''
     if t > 3600:
         H = t // 3600
-        M = (t - 3600*H) // 60
-        return '%dh%2d'%(H,M)
+        M = (t - 3600 * H) // 60
+        return '%dh%2d' % (H, M)
     elif t > 60:
         M = t // 60
-        T = int(t-60*M)
-        return '%2dm%2d'%(M,T)
+        T = int(t - 60 * M)
+        return '%2dm%2d' % (M, T)
     else:
-        return '%2ds'%int(t)
+        return '%2ds' % int(t)
+
 
 def cleanup_astra():
     '''
@@ -534,6 +529,7 @@ def cleanup_astra():
     atexit.register(del_astra)
     signal.signal(signal.SIGTERM, del_astra)
     signal.signal(signal.SIGINT, del_astra)
+
 
 cleanup_astra()
 
@@ -584,7 +580,7 @@ class tomo_iter_alg(tomo_alg):
             def frmt(x):
                 if type(x) == int:
                     x = '% 3d' % x
-                elif isscalar(x):
+                elif np.isscalar(x):
                     x = '% 1.3e' % float(x)
                 else:
                     x = str(x)
@@ -601,7 +597,7 @@ class tomo_iter_alg(tomo_alg):
                 leap = min(callback_freq, maxiter - i)
                 self.step(i, leap)
                 i += leap
-                prints.append((i, time() - tic, ) +
+                prints.append((i, time() - tic,) +
                               Tuple(self.callback(callback[2:])))
                 print(padstr('%3d%%' % (i / maxiter * 100), 6), padstr(_timelen(prints[-1][1]), 7),
                       *(frmt(c) for c in prints[-1][2:]), flush=True)
@@ -609,7 +605,7 @@ class tomo_iter_alg(tomo_alg):
 
             dtype = [(callback[i], ('S20' if type(prints[0][i]) is str else 'f4'))
                      for i in range(len(callback))]
-            prints = array(prints, dtype)
+            prints = np.array(prints, dtype)
             Q = {callback[j]: prints[callback[j]]
                  for j in range(len(callback))}
 
@@ -642,9 +638,9 @@ def Vector(*x):
     if hasattr(x[0], 'gi_yieldfrom'):
         x = tuple(x[0])
 
-    X = array(x, dtype=object)
+    X = np.array(x, dtype=object)
     if X.ndim != 1:
-        X = empty(len(x), dtype=object)
+        X = np.empty(len(x), dtype=object)
         X[:] = x
     return X
 
@@ -659,7 +655,7 @@ class scalar_mat(LinearOperator):
     def _matvec(self, x):
         s = self.scale
         if s == 0:
-            return zeros(self.shape[0], dtype=x.dtype)
+            return np.zeros(self.shape[0], dtype=x.dtype)
         elif s == 1:
             return x.copy()
         elif s == -1:
@@ -670,7 +666,7 @@ class scalar_mat(LinearOperator):
     def _rmatvec(self, x):
         s = self.scale
         if s == 0:
-            return zeros(self.shape[1], dtype=x.dtype)
+            return np.zeros(self.shape[1], dtype=x.dtype)
         elif s == 1:
             return x.copy()
         elif s == -1:
@@ -684,28 +680,28 @@ class Matrix(LinearOperator):
     def __init__(self, m, shape=None, _adjoint=None):
         # Create block matrix
         if shape is None:
-            buf = array(m, dtype=object)
+            buf = np.array(m, dtype=object)
             if buf.ndim < 2:
                 buf.shape = [-1, 1]
             elif buf.ndim > 2:
                 if type(m) not in (list, tuple):
-                    buf = empty((1, 1), dtype=object)
+                    buf = np.empty((1, 1), dtype=object)
                     buf[0, 0] = m
                 elif type(m[0]) not in (list, tuple):
-                    buf = empty((len(m), 1), dtype=object)
+                    buf = np.empty((len(m), 1), dtype=object)
                     buf[:, 0] = m
                 else:
-                    buf = empty((len(m), len(m[0])), dtype=object)
+                    buf = np.empty((len(m), len(m[0])), dtype=object)
                     for i in range(len(m)):
                         buf[i] = m[i]
         else:
-            buf = empty(shape, dtype=object)
+            buf = np.empty(shape, dtype=object)
             for i in range(len(m)):
                 buf[i] = m[i]
 
         # Check shapes of blocks
-        h, w = 0 * empty(buf.shape[0], dtype=int), 0 * \
-            empty(buf.shape[1], dtype=int)
+        h, w = 0 * np.empty(buf.shape[0], dtype=int), 0 * \
+            np.empty(buf.shape[1], dtype=int)
         for i in range(buf.shape[0]):
             for j in range(buf.shape[1]):
                 b = buf[i, j]
@@ -717,7 +713,7 @@ class Matrix(LinearOperator):
             for j in range(buf.shape[1]):
                 if buf[i, j] is None:
                     buf[i, j] = scalar_mat((h[i], w[j]), 0)
-                elif isscalar(buf[i, j]):
+                elif np.isscalar(buf[i, j]):
                     buf[i, j] = scalar_mat((h[i], w[j]), buf[i, j])
                 elif not hasattr(buf[i, j], 'shape'):
                     buf[i, j].shape = (h[i], w[j])
@@ -729,12 +725,12 @@ class Matrix(LinearOperator):
 
         if _adjoint is None:
             # Adjoint operator
-            buf = empty((buf.shape[1], buf.shape[0]), dtype=object)
+            buf = np.empty((buf.shape[1], buf.shape[0]), dtype=object)
             for i in range(buf.shape[0]):
                 for j in range(buf.shape[1]):
-                    # At some point the Hermitian adjoint broke, either a 
+                    # At some point the Hermitian adjoint broke, either a
                     # problem with astra or scipy.
-                    buf[i, j] = self.m[j, i].T # H 
+                    buf[i, j] = self.m[j, i].T  # H
             self.mH = Matrix(buf, _adjoint=self)
         else:
             self.mH = _adjoint
@@ -770,13 +766,13 @@ class diff(LinearOperator):
             return
 
         if order == 1:
-            shape2 = (len(shape) * prod(shape), prod(shape))
+            shape2 = (len(shape) * np.prod(shape), np.prod(shape))
             if bumpup:
                 shape2 = tuple(len(shape) * s for s in shape2)
         elif order == 2:
-            shape2 = (len(shape)**2 * prod(shape), prod(shape))
+            shape2 = (len(shape) ** 2 * np.prod(shape), np.prod(shape))
         LinearOperator.__init__(self, dtype, shape2)
-        self.vol_shape = array(shape, dtype='i4')
+        self.vol_shape = np.array(shape, dtype='i4')
 
         self.order = order
         if order == 1:
@@ -800,7 +796,7 @@ class diff(LinearOperator):
         ravel = (f.ndim == 1)
         f = f.reshape(self.vol_shape)
         dim = f.ndim
-        Df = empty(f.shape + (dim,), dtype=f.dtype, order='C')
+        Df = np.empty(f.shape + (dim,), dtype=f.dtype, order='C')
 
         mystr = str(dim) + '_' + '0'
         if c_diff['grad'].get(mystr, None) is not None:
@@ -840,7 +836,7 @@ class diff(LinearOperator):
         dim = len(self.vol_shape)
         Df = Df.reshape(*self.vol_shape, dim)
 
-        f = empty(Df.shape[:-1], dtype=Df.dtype, order='C')
+        f = np.empty(Df.shape[:-1], dtype=Df.dtype, order='C')
 
         mystr = str(dim) + '_' + '0'
         if c_diff['gradT'].get(mystr, None) is not None:
@@ -887,7 +883,7 @@ class diff(LinearOperator):
         ravel = (f.ndim == 1)
         dim = len(self.vol_shape)
 
-        if f.size == prod(self.vol_shape):
+        if f.size == np.prod(self.vol_shape):
             # compute f -> Df
             f = f.reshape(self.vol_shape)
         else:
@@ -895,7 +891,7 @@ class diff(LinearOperator):
             f = f.reshape(*self.vol_shape, dim)
 
         Dim = f.ndim
-        Df = empty(f.shape + (dim,), dtype=f.dtype, order='C')
+        Df = np.empty(f.shape + (dim,), dtype=f.dtype, order='C')
 
         mystr = str(dim) + '_' + ('0' if dim == Dim else '1')
         if c_diff['grad2'].get(mystr, None) is not None:
@@ -934,7 +930,7 @@ class diff(LinearOperator):
         ravel = (Df.ndim == 1)
         dim = len(self.vol_shape)
 
-        if Df.size == prod(self.vol_shape) * dim:
+        if Df.size == np.prod(self.vol_shape) * dim:
             # compute Df -> div(Df)
             Df = Df.reshape(*self.vol_shape, dim)
         else:
@@ -942,7 +938,7 @@ class diff(LinearOperator):
             Df = Df.reshape(*self.vol_shape, dim, dim)
 
         Dim = Df.ndim - 1
-        f = empty(Df.shape[:-1], dtype=Df.dtype, order='C')
+        f = np.empty(Df.shape[:-1], dtype=Df.dtype, order='C')
 
         mystr = str(dim) + '_' + ('0' if dim == Dim else '1')
         if c_diff['grad2T'].get(mystr, None) is not None:
@@ -1009,7 +1005,7 @@ class diff(LinearOperator):
 
         try:
             D2f = D2f.reshape(-1, dim, dim)
-            tmp = empty(D2f.shape, dtype=D2f.dtype)
+            tmp = np.empty(D2f.shape, dtype=D2f.dtype)
             sym(D2f, tmp)
             D2f = tmp.reshape(*self.vol_shape, dim, dim)
         except Exception:
@@ -1037,21 +1033,21 @@ class diff(LinearOperator):
                 return 2 * dim
             elif order == 2:
                 return 2 * dim ** .5
-            elif order in ['inf', inf]:
+            elif order in ['inf', np.inf]:
                 return 2
         elif self.order == 2:
             if order == 1:
                 return 4 * dim ** 2
             elif order == 2:
                 return 4 * dim
-            elif order in ['inf', inf]:
+            elif order in ['inf', np.inf]:
                 return 4
         else:
             if order == 1:
                 return (2 * dim) ** order
             elif order == 2:
                 return (4 * dim) ** (order / 2)
-            elif order in ['inf', inf]:
+            elif order in ['inf', np.inf]:
                 return 2 ** order
 
 
@@ -1061,16 +1057,16 @@ def getVec(mat, rand=False):
     '''
     if len(mat.shape) in [1, 2]:
         if mat.dtype == object:
-            Z = empty(mat.shape[-1], dtype=mat.dtype)
+            Z = np.empty(mat.shape[-1], dtype=mat.dtype)
             if len(mat.shape) == 1:
                 Z = Vector(getVec(m, rand) for m in mat)
             else:
-                Z = Vector(getVec(m, rand) for m in mat[0, :])
+                Z = Vector(getVec(m, rand) for m in mat[0,:])
         else:
             if rand:
-                Z = random.rand(mat.shape[-1]).astype(mat.dtype)
+                Z = np.random.rand(mat.shape[-1]).astype(mat.dtype)
             else:
-                Z = zeros(mat.shape[-1], dtype=mat.dtype)
+                Z = np.zeros(mat.shape[-1], dtype=mat.dtype)
     else:
         raise ValueError('input must either be or dimension 1 or 2')
     return Z
@@ -1080,7 +1076,7 @@ def vecNorm(x):
     ''' Computes the Euclidean norm of a vector'''
     x = x.reshape(-1)
     if x.dtype == object:
-        x = array([vecNorm(xi) for xi in x])
+        x = np.array([vecNorm(xi) for xi in x])
     return norm(x.reshape(-1))
 
 
@@ -1158,8 +1154,9 @@ class FBP(tomo_alg):
         if op.backend == 'astra':
             if dim == 3:
                 small = tomo_data(data[0], data.angles, geom=data.geom)
-                op = small.getOperator(
-                    backend='astra', GPU=op.is_cuda, vol_shape=op.vshape[1:], **kwargs)
+                kwargs['backend'] = 'astra'
+                kwargs['GPU'] = kwargs.get('GPU', op.is_cuda)
+                op = small.getOperator(vol_shape=op.vshape[1:], **kwargs)
 
             from astra import data2d, astra_dict, algorithm
 
@@ -1187,7 +1184,7 @@ class FBP(tomo_alg):
                     cfg['ReconstructionDataId'] = rec_id
                     alg_id = algorithm.create(cfg)
                     algorithm.run(alg_id, 1)
-                    out[:, :] = data2d.get(rec_id)
+                    out[:,:] = data2d.get(rec_id)
                     algorithm.delete(alg_id)
                     data2d.delete([rec_id, d_id])
                     return out
@@ -1197,7 +1194,7 @@ class FBP(tomo_alg):
         elif op.backend == 'skimage':
             from skimage.transform import iradon
             filter = 'ramp' if self.filter is None else self.filter
-            theta = data.angles * 180 / pi
+            theta = data.angles * 180 / np.pi
 
             def slice_fbp(x):
                 return iradon(
@@ -1214,9 +1211,9 @@ class FBP(tomo_alg):
                 'backend must be astra or skimage for this algorithm')
 
         if self.constraint[0] is not None:
-            recon = maximum(self.constraint[0], recon)
+            recon = np.maximum(self.constraint[0], recon)
         if self.constraint[1] is not None:
-            recon = minimum(self.constraint[1], recon)
+            recon = np.minimum(self.constraint[1], recon)
         self.recon = recon
         return recon
 
@@ -1298,9 +1295,9 @@ class SIRT(tomo_alg):
                 'backend must be astra for this algorithm')
 
         if self.constraint[0] is not None:
-            recon = maximum(self.constraint[0], recon)
+            recon = np.maximum(self.constraint[0], recon)
         if self.constraint[1] is not None:
-            recon = minimum(self.constraint[1], recon)
+            recon = np.minimum(self.constraint[1], recon)
         self.recon = recon
         return recon
 
@@ -1354,8 +1351,9 @@ class SART(tomo_alg):
         if op.backend == 'astra':
             if dim == 3:
                 small = tomo_data(data[0], data.angles, geom=data.geom)
-                op = small.getOperator(
-                    backend='astra', GPU=op.is_cuda, **kwargs)
+                kwargs['backend'] = 'astra'
+                kwargs['GPU'] = kwargs.get('GPU', op.is_cuda)
+                op = small.getOperator(vol_shape=op.vshape[1:], **kwargs)
 
             from astra import data2d, astra_dict, algorithm
 
@@ -1394,7 +1392,7 @@ class SART(tomo_alg):
                     alg_id = algorithm.create(cfg)
                     algorithm.run(
                         alg_id, 100 if self.iterations is None else self.iterations)
-                    out[:, :] = data2d.get(rec_id)
+                    out[:,:] = data2d.get(rec_id)
                     algorithm.delete(alg_id)
                     data2d.delete([rec_id, d_id])
                     return out
@@ -1403,7 +1401,7 @@ class SART(tomo_alg):
 
         elif op.backend == 'skimage':
             from skimage.transform import iradon_sart
-            theta = data.angles * 180 / pi
+            theta = data.angles * 180 / np.pi
             if all(m is not None for m in self.constraint):
                 clip = self.constraint
             else:
@@ -1424,9 +1422,9 @@ class SART(tomo_alg):
                 'backend must be astra or skimage for this algorithm')
 
         if self.constraint[0] is not None:
-            recon = maximum(self.constraint[0], recon)
+            recon = np.maximum(self.constraint[0], recon)
         if self.constraint[1] is not None:
-            recon = minimum(self.constraint[1], recon)
+            recon = np.minimum(self.constraint[1], recon)
         self.recon = recon
         return recon
 
@@ -1501,7 +1499,7 @@ class stackProxFunc(proxFunc):
         return sum(self.__funcs[i](x[i]) for i in range(len(x)))
 
     def setprox(self, t):
-        if isscalar(t):
+        if np.isscalar(t):
             for f in self.__funcs:
                 f.setprox(t)
         else:
@@ -1540,12 +1538,12 @@ class NONNEG(proxFunc):
     def __init__(self):
         proxFunc.__init__(self,
                           lambda _: 0,
-                          prox=lambda x: maximum(0, x),
+                          prox=lambda x: np.maximum(0, x),
                           setprox=lambda _: None,
                           violation=lambda x: max(0, -x.min()))
 
         dual = proxFunc(lambda _: 0,
-                        prox=lambda x: minimum(0, x),
+                        prox=lambda x: np.minimum(0, x),
                         setprox=lambda _: None,
                         violation=lambda x: max(0, x.max()))
         dualableFunc(self, dual)
@@ -1574,9 +1572,9 @@ class L2(proxFunc):
         proxg(Y,y) = (proxg(Y), proxg(y))
         '''
         if translation is None:
-            def f(x): return (scale * .5) * norm(x, 2)**2
+            def f(x): return (scale * .5) * norm(x, 2) ** 2
 
-            def g(y): return (.5 / scale) * norm(y, 2)**2
+            def g(y): return (.5 / scale) * norm(y, 2) ** 2
 
             if scale == 1:
                 def df(x): return x
@@ -1599,10 +1597,10 @@ class L2(proxFunc):
 
             def f(x):
                 x = x - translation
-                return (scale * .5) * norm(x, 2)**2
+                return (scale * .5) * norm(x, 2) ** 2
 
             def g(y):
-                return (.5 / scale) * norm(y, 2)**2 + (y.conj() * translation).real.sum()
+                return (.5 / scale) * norm(y, 2) ** 2 + (y.conj() * translation).real.sum()
 
             if scale == 1:
                 def df(x): return x - translation
@@ -1668,7 +1666,7 @@ class L1(proxFunc):
                 indPos, indNeg = x > t, x < -t
                 X[indPos] -= t
                 X[indNeg] += t
-                X[logical_not(logical_or(indPos, indNeg))] = 0
+                X[np.logical_not(np.logical_or(indPos, indNeg))] = 0
                 return X
 
             def proxg(y):
@@ -1693,7 +1691,7 @@ class L1(proxFunc):
                 indPos, indNeg = x > t, x < -t
                 X[indPos] -= t
                 X[indNeg] += t
-                X[logical_not(logical_or(indPos, indNeg))] = 0
+                X[np.logical_not(np.logical_or(indPos, indNeg))] = 0
                 return X + translation
 
             def proxg(y):
@@ -1702,7 +1700,7 @@ class L1(proxFunc):
                 Y[Y < -scale] = -scale
                 return Y
 
-        def violation(x): return max(0, norm(x, inf) / scale - 1)
+        def violation(x): return max(0, norm(x, np.inf) / scale - 1)
 
         proxFunc.__init__(self, f, prox=proxf, setprox=setproxf)
         dual = proxFunc(g, prox=proxg,
@@ -1748,13 +1746,13 @@ class L1_2(proxFunc):
             def proxf(x):
                 t = self.__proxfparam
                 n = self.__vecnorm(x.reshape(self.shape))
-                n = maximum(0, 1 - t / n)
+                n = np.maximum(0, 1 - t / n)
                 return x * n
 
             def proxg(y):
                 y = y.reshape(self.shape)
-                out = empty(y.shape, dtype=y.dtype)
-                shrink(y, scale, out)
+                out = np.empty(y.shape, dtype=y.dtype)
+                project(y, scale, out)
                 return out
         else:
             translation = translation.reshape(self.shape)
@@ -1774,12 +1772,12 @@ class L1_2(proxFunc):
                 t = self.__proxfparam
                 x = x.reshape(self.shape) - translation
                 n = self.__vecnorm(x)
-                n = maximum(0, 1 - t / n)
+                n = np.maximum(0, 1 - t / n)
                 return x * n + translation
 
             def proxg(y):
                 y = y.reshape(self.shape) - self.__proxgparam
-                shrink(y, scale, y)
+                project(y, scale, y)
                 return y
 
         def violation(y):
@@ -1871,12 +1869,12 @@ class PDHG(tomo_iter_alg):
         if steps in [None, 'None', 'none']:
             self._stepsize = lambda _: False
         elif steps[0].lower() == 'a':
-            if not (isscalar(self.s) and isscalar(self.t)):
+            if not (np.isscalar(self.s) and np.isscalar(self.t)):
                 raise ValueError(
                     'Step sizes must be scalar for adaptive choice')
             self._stepsize = self._adaptive(**stepParams)
         elif steps[0].lower() == 'b':
-            if not (isscalar(self.s) and isscalar(self.t)):
+            if not (np.isscalar(self.s) and np.isscalar(self.t)):
                 raise ValueError(
                     'Step sizes must be scalar for backtracking choice')
             self._stepsize = self._backtrack(**stepParams)
@@ -1915,6 +1913,7 @@ class PDHG(tomo_iter_alg):
 
             # Dual step:
             tmp = self.y
+            tmp2 = self.y + self.s * (2 * self.Ax - self.Axm1)
             self.y = self.g.prox(self.y + self.s * (2 * self.Ax - self.Axm1))
             self.ym1, self.Aym1 = tmp, self.Ay
             self.Ay = self.A.T * self.y
@@ -1932,7 +1931,7 @@ class PDHG(tomo_iter_alg):
             dy = (alg.y - alg.ym1)
 
             b = (2 * alg.t * alg.s * vecIP(dx, alg.Ay - alg.Aym1).real) / (
-                alg.s * vecNorm(dx)**2 + alg.t * vecNorm(dy)**2)
+                alg.s * vecNorm(dx) ** 2 + alg.t * vecNorm(dy) ** 2)
 
             if b > gamma:
                 b *= beta / gamma
@@ -2018,7 +2017,7 @@ class PDHG(tomo_iter_alg):
     @property
     def _violation(self):
         return (self.f.violation(self.x) + self.f.dual.violation(-self.Ay)
-                + self.g.dual.violation(self.Ax) + self.g.violation(self.y))
+                +self.g.dual.violation(self.Ax) + self.g.violation(self.y))
 
 
 class TV(PDHG):
@@ -2053,21 +2052,22 @@ class TV(PDHG):
 
         normR = [R * (getVec(R) + 1), R.T * (getVec(R.T) + 1)]
         normR += [R.T * normR[0], R * normR[1]]
-        normR = [n.max()**.5 for n in normR]
+        normR = [n.max() ** .5 for n in normR]
         normR = min(normR[0] * normR[1], *normR[2:])
         normD = self.d.norm()
 
         A = Matrix([[(normD / normR) * R], [self.d]])
-        normA = normD * 2**.5
+        normA = normD * 2 ** .5
 
-        dataScale = abs(R.T * data.ravel()).max()
+        dataScale = max(abs(R.T * data.ravel()).max(), 1e-6)
+        self.data = data  # pre-scaled
         data = data.__array__() / (dataScale * normD / normR)
-        self.dataScale = dataScale * (normD / normR)**2
+        self.dataScale = dataScale * (normD / normR) ** 2
 
         self.weight = kwargs.get('weight', self.weight)
         gstar = stackProxFunc(
             L2(scale=1, translation=data),
-            L1_2(size=prod(vol_shape), scale=self.weight)
+            L1_2(size=np.prod(vol_shape), scale=self.weight)
         )
 
         # Choose starting point:
@@ -2134,26 +2134,27 @@ class TGV(PDHG):
 
         normR = [R * (getVec(R) + 1), R.T * (getVec(R.T) + 1)]
         normR += [R.T * normR[0], R * normR[1]]
-        normR = [n.max()**.5 for n in normR]
+        normR = [n.max() ** .5 for n in normR]
         normR = min(normR[0] * normR[1], *normR[2:])
         normD = self.d1.norm()
         A = Matrix([[(normD / normR) * R, 0],
                     [self.d1, -1],
                     [0, self.d2]])
-        normA = (3 * normD**2 + 1) ** .5
+        normA = (3 * normD ** 2 + 1) ** .5
 
-        dataScale = abs(R.T * data.ravel()).max()
+        dataScale = max(abs(R.T * data.ravel()).max(), 1e-6)
+        self.data = data  # pre-scaled
         data = data.__array__() / (dataScale * normD / normR)
-        self.dataScale = dataScale * (normD / normR)**2
+        self.dataScale = dataScale * (normD / normR) ** 2
 
         weight = kwargs.get('weight', self.weight)
-        if isscalar(weight):
+        if np.isscalar(weight):
             weight = (weight, weight)
         self.weight = weight
         gstar = stackProxFunc(
             L2(scale=1, translation=data),
-            L1_2(size=prod(vol_shape), scale=weight[0]),
-            L1_2(size=prod(vol_shape), scale=weight[1])
+            L1_2(size=np.prod(vol_shape), scale=weight[0]),
+            L1_2(size=np.prod(vol_shape), scale=weight[1])
         )
 
         # Choose starting point:
@@ -2189,24 +2190,23 @@ class TGV(PDHG):
 
 
 if __name__ == '__main__':
-    from numpy import linspace
     from skimage.data import moon, binary_blobs
     from matplotlib import pyplot as plt
 
     data2d = moon().astype('f4')
     data3d = binary_blobs(length=128, n_dim=3,
                           volume_fraction=0.01, seed=1).astype('f4')
-    angles = linspace(0, pi, 180)
+    angles = np.linspace(0, np.pi, 180)
     # dim=0 is tilt axis
     # dim=1 is y/z
     # At angle=0 we see [x,z]
     # Sinogram = [x,theta,y/z]
 
     # Read in 2d data with angles
-    tomo_data2d = tomo_data(zeros((len(angles),) + data2d.shape[:-1]),
+    tomo_data2d = tomo_data(np.zeros((len(angles),) + data2d.shape[:-1]),
                             angles, degrees=False, geom='parallel')
     # Read in 3d data with angles
-    tomo_data3d = tomo_data(zeros((data3d.shape[0], len(angles), data3d.shape[1])),
+    tomo_data3d = tomo_data(np.zeros((data3d.shape[0], len(angles), data3d.shape[1])),
                             angles, degrees=False, geom='parallel',
                             tilt_axis=0, stack_dim=1)
 
@@ -2265,32 +2265,16 @@ if __name__ == '__main__':
 # callback=('gap', 'primal', 'dual', 'violation', 'step'))[0]
 
     plt.figure('2D Data')
-    plt.subplot(221)
-    plt.imshow(data2d)
-    plt.title('data')
-    plt.subplot(222)
-    plt.imshow(sino2d, aspect='auto')
-    plt.title('Sinogram')
-    plt.subplot(223)
-    plt.imshow(bp2d)
-    plt.title('Back-projection')
-    plt.subplot(224)
-    plt.imshow(rec2d)
-    plt.title('Reconstruction')
+    plt.subplot(221); plt.imshow(data2d); plt.title('data')
+    plt.subplot(222); plt.imshow(sino2d, aspect='auto'); plt.title('Sinogram')
+    plt.subplot(223); plt.imshow(bp2d); plt.title('Back-projection')
+    plt.subplot(224); plt.imshow(rec2d); plt.title('Reconstruction')
 
     half = int(vol3d[0] / 2)
     plt.figure('3D Data')
-    plt.subplot(221)
-    plt.imshow(data3d[half])
-    plt.title('Slice of data')
-    plt.subplot(222)
-    plt.imshow(sino3d[:, 90, :])
-    plt.title('Single projection')
-    plt.subplot(223)
-    plt.imshow(bp3d[half])
-    plt.title('2D slice of back projection')
-    plt.subplot(224)
-    plt.imshow(rec3d[half])
-    plt.title('2D slice of Reconstruction')
+    plt.subplot(221); plt.imshow(data3d[half]); plt.title('Slice of data')
+    plt.subplot(222); plt.imshow(sino3d[:, 90,:]); plt.title('Single projection')
+    plt.subplot(223); plt.imshow(bp3d[half]); plt.title('2D slice of back projection')
+    plt.subplot(224); plt.imshow(rec3d[half]); plt.title('2D slice of Reconstruction')
 
     plt.show()
