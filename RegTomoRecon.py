@@ -13,35 +13,72 @@ _GPU = False
 
 try:
     import numba
+    _params = dict(target='parallel', fastmath=True, cache=True)
 
-    @numba.jit(nopython=True, parallel=True, fastmath=True)
+    @numba.guvectorize(['T[:],T,T[:]'.replace('T', T) for T in ('f4', 'f8')], '(n),()->(n)', **_params)
     def project(y, scale, out):
-        '''
-        out[i] = min(1, scale/|y[i]|) * y[i]
-        '''
-        for i in numba.prange(y.shape[0]):
-            n = 0
-            for j in range(y.shape[1]):
-                n += y[i, j] * y[i, j]  # n = |y[i]|^2
-            if n < scale ** 2:
-                for j in range(y.shape[1]):
-                    out[i, j] = y[i, j]
-            else:
-                n = min(scale * (n ** -.5), 1e8)
-                for j in range(y.shape[1]):
-                    out[i, j] = n * y[i, j]
+        n = 0
+        for j in range(y.size):
+            n += y[j] ** 2
+        if n <= scale ** 2:
+            for j in range(y.size):
+                out[j] = y[j]
+        else:
+            n = min(scale * (n ** -.5), 1e8)
+            for j in range(y.size):
+                out[j] = n * y[j]
 
-    @numba.jit(nopython=True, parallel=True, fastmath=True)
+    @numba.vectorize(['T(T,T)'.replace('T', T) for T in ('f4', 'f8')], **_params)
+    def project1D(y, scale):
+        '''
+        out = min(1, scale/|y|) * y
+        '''
+        if y > scale:
+            return scale
+        elif y < -scale:
+            return -scale
+        else:
+            return y
+
+    @numba.vectorize(['T(T,T)'.replace('T', T) for T in ('f4', 'f8')], **_params)
+    def shrink1D(y, scale):
+        '''
+        out = max(0, |y|-scale) * sign(y)
+        '''
+        if y > scale:
+            return y - scale
+        elif y < -scale:
+            return y + scale
+        else:
+            return 0
+
+    @numba.jit(fastmath=True, parallel=True, cache=True)
+    def L1_gap(A, X, scale):
+        '''
+        return |A+scale*sign(X)|
+        '''
+        out = 0
+        for i in numba.prange(A.size):
+            a, x = A[i], X[i]
+            if x > 0:
+                v = abs(a + scale)
+            elif x < 0:
+                v = abs(a - scale)
+            else:
+                v = abs(a) - scale
+            out = max(out, v)
+        return out
+
+    @numba.guvectorize(['T[:,:],T[:,:]'.replace('T', T) for T in ('f4', 'f8')], '(n,n)->(n,n)', nopython=True, target='parallel', fastmath=True, cache=True)
     def sym(A, B):
         '''
         B[i,j,J] = .5(A[i,j,J]+A[i,J,j])
         '''
-        for i in numba.prange(A.shape[0]):
-            for j0 in range(A.shape[1]):
-                for j1 in range(j0):
-                    B[i, j0, j1] = .5 * (A[i, j0, j1] + A[i, j1, j0])
-                    B[i, j1, j0] = B[i, j0, j1]
-                B[i, j0, j0] = A[i, j0, j0]
+        for j0 in range(A.shape[1]):
+            for j1 in range(j0):
+                B[j0, j1] = .5 * (A[j0, j1] + A[j1, j0])
+                B[j1, j0] = B[j0, j1]
+            B[j0, j0] = A[j0, j0]
 
     def genbody(lines, var, end, tab, dim, options):
         from itertools import product
@@ -310,12 +347,18 @@ try:
         print('Compilation successful')
 
 except Exception:
+    raise
     # numpy fall-back
     if 'project' not in globals():
-        def project(y, scale, out):
+        def project(y, scale):
             n = norm(y, 2, -1, True) + 1e-8
             n = np.minimum(1, scale / n)
-            out[:,:] = y * n
+            return y * n
+        def project1D(y, scale): return project(y[:, None], scale)[:, 0]
+        def shrink1D(y, scale): return np.sign(y) * np.maximum(0, y.abs() - scale)
+
+        def sym(A): return .5 * (A + np.swapaxes(A, -2, -1))
+
 c_diff = {'grad': {}, 'gradT': {}, 'grad2': {}, 'grad2T': {}, }
 for i in range(3):
     for j in range(2):
@@ -428,7 +471,9 @@ class tomo_data(np.ndarray):
                     ID = astra.create_projector('cuda' + dim_str,
                                                 proj_geom, vol_geom)
                 else:
-                    ID = astra.create_projector('linear' + dim_str,
+#                     ID = astra.create_projector('linear' + dim_str,
+#                                                 proj_geom, vol_geom)
+                    ID = astra.create_projector('line' + dim_str,
                                                 proj_geom, vol_geom)
             else:
                 raise NotImplementedError
@@ -529,9 +574,6 @@ def cleanup_astra():
     atexit.register(del_astra)
     signal.signal(signal.SIGTERM, del_astra)
     signal.signal(signal.SIGINT, del_astra)
-
-
-cleanup_astra()
 
 
 class tomo_alg():
@@ -735,8 +777,7 @@ class Matrix(LinearOperator):
         else:
             self.mH = _adjoint
 
-    def _matvec(self, x):
-        return self.m.dot(x)
+    def _matvec(self, x): return self.m.dot(x)
 
     def _rmatvec(self, y): return self.mH.dot(y)
 
@@ -762,20 +803,24 @@ class diff(LinearOperator):
             raise ValueError('order = %s not supported' % str(order))
 
         if order == 0:
-            scalar_mat.__init__(self, shape, 1, dtype)
-            return
+            scalar_mat.__init__(self, (np.prod(shape),) * 2, 1, dtype)
+        else:
+            if order == 1:
+                shape2 = (len(shape) * np.prod(shape), np.prod(shape))
+                if bumpup:
+                    shape2 = tuple(len(shape) * s for s in shape2)
+            elif order == 2:
+                shape2 = (len(shape) ** 2 * np.prod(shape), np.prod(shape))
+            LinearOperator.__init__(self, dtype, shape2)
 
-        if order == 1:
-            shape2 = (len(shape) * np.prod(shape), np.prod(shape))
-            if bumpup:
-                shape2 = tuple(len(shape) * s for s in shape2)
-        elif order == 2:
-            shape2 = (len(shape) ** 2 * np.prod(shape), np.prod(shape))
-        LinearOperator.__init__(self, dtype, shape2)
         self.vol_shape = np.array(shape, dtype='i4')
 
         self.order = order
-        if order == 1:
+        if order == 0:
+            self._matvec = self._rmatvec = lambda x: x.copy()
+            self._transpose = (lambda: self)
+            return
+        elif order == 1:
             if bumpup:
                 self._matvec = self.__grad2
                 self._rmatvec = self.__grad2T
@@ -981,17 +1026,9 @@ class diff(LinearOperator):
         # then backwards then symmetrising.
         ravel = (f.ndim == 1)
         f = f.reshape(self.vol_shape)
-        dim = f.ndim
 
         D2f = self.__grad2(self.__grad(f))
-
-        try:
-            sym(D2f.reshape(-1, dim, dim), D2f.reshape(-1, dim, dim))
-        except NameError:
-            for i in range(dim):
-                for j in range(i + 1, dim):
-                    D2f[..., i, j] = 0.5 * (D2f[..., i, j] + D2f[..., j, i])
-                    D2f[..., j, i] = D2f[..., i, j]
+        sym(D2f, out=D2f)
 
         if ravel:
             return D2f.ravel()
@@ -1002,19 +1039,8 @@ class diff(LinearOperator):
         # Adjoint of symmetrisation is symmetrisation
         ravel = (D2f.ndim == 1)
         dim = len(self.vol_shape)
-
-        try:
-            D2f = D2f.reshape(-1, dim, dim)
-            tmp = np.empty(D2f.shape, dtype=D2f.dtype)
-            sym(D2f, tmp)
-            D2f = tmp.reshape(*self.vol_shape, dim, dim)
-        except Exception:
-            D2f = D2f.copy().reshape(*self.vol_shape, dim, dim)
-            for i in range(dim):
-                for j in range(i + 1, dim):
-                    D2f[..., i, j] = 0.5 * (D2f[..., i, j] + D2f[..., j, i])
-                    D2f[..., j, i] = D2f[..., i, j]
-
+        D2f = D2f.reshape(*self.vol_shape, dim, dim)
+        sym(D2f, out=D2f)
         D2f = self.__gradT(self.__grad2T(D2f))
 
         if ravel:
@@ -1027,6 +1053,8 @@ class diff(LinearOperator):
         return None
 
     def norm(self, order=2):
+        if self.order == 0:
+            return 1
         dim = len(self.vol_shape)
         if self.order == 1:
             if order == 1:
@@ -1094,7 +1122,7 @@ def poweriter(mat, maxiter=300):
     x = getVec(mat, rand=True)
     for _ in range(maxiter):
         x /= vecNorm(x)
-        x = mat.H * (mat * x)
+        x = mat.T.dot(mat.dot(x))
     return vecNorm(x) ** .5
 
 
@@ -1429,6 +1457,73 @@ class SART(tomo_alg):
         return recon
 
 
+class smoothFunc():
+    '''
+    Base class for a smooth function f (bounded derivative), 
+    i.e. for all x and y:
+        f(y) <= f(x) + f'(x)(y-x) + L/2|y-x|^2
+    where L is the Lipshitz constant.
+    '''
+    def __init__(self, f, grad=None, Lip=None, violation=None):
+        self._f, self._grad = f, grad
+        if Lip is not None:
+            self.Lip = Lip
+        else:  # Lip=None means implemented by child class
+            assert 'Lip' in dir(self)
+
+        if violation is None:
+            self._violation = lambda _: 0
+        else:
+            self._violation = violation
+
+    def __call__(self, x):
+        F = self._f(x.ravel())
+        return F[0] if self._grad is None else F
+
+    def grad(self, x):
+        if self._grad is None:
+            return self._f(x.ravel())[1].ravel()
+        else:
+            return self._grad(x.ravel()).ravel()
+
+    def violation(self, x): return self._violation(x.ravel())
+
+
+class L2fidelity(smoothFunc):
+    def __init__(self, scale=1, A=None, translation=None, normA=None):
+        assert A is not None
+
+        # This implementation is ugly but appears to be more accurate
+        # when A and A.T are not exact conjugates.
+        if translation is None:
+            def f(x):
+                x = x.ravel()
+                return (self.scale * .5) * x.dot(A.T.dot(A.dot(x)))
+            def df(x):
+                tmp = self.A.T.dot(self.A.dot(x))
+                return tmp if self.scale == 1 else self.scale * tmp
+
+        else:
+            translation = translation.reshape(A.shape[0])
+            Ad, d2 = A.T.dot(translation), translation.dot(translation)
+            def f(x):
+                x = x.ravel()
+                return (self.scale * .5) * (x.dot(self.A.T.dot(self.A.dot(x)) - 2 * Ad) + d2)
+            def df(x):
+                tmp = self.A.T.dot(self.A.dot(x)) - Ad
+                return tmp if self.scale == 1 else self.scale * tmp
+
+            def f(x): return .5 * ((A.dot(x) - translation) ** 2).sum()
+            def df(x):return A.T.dot(A.dot(x) - translation)
+
+        normA = 1.01 * poweriter(A) if normA is None else normA
+        smoothFunc.__init__(self, f, df)
+        self.scale, self.A, self._normA = scale, A, normA
+
+    @property
+    def Lip(self): return self.scale * self._normA ** 2
+
+
 class proxFunc():
     '''
     Base class for proximal projection which, for a function f and scale t, 
@@ -1660,20 +1755,9 @@ class L1(proxFunc):
 
             def setproxg(_): self.__proxgparam = 0
 
-            def proxf(x):
-                t = self.__proxfparam
-                X = x.copy()
-                indPos, indNeg = x > t, x < -t
-                X[indPos] -= t
-                X[indNeg] += t
-                X[np.logical_not(np.logical_or(indPos, indNeg))] = 0
-                return X
+            def proxf(x): return shrink1D(x, self.__proxfparam)
 
-            def proxg(y):
-                Y = y.copy()
-                Y[Y > scale] = scale
-                Y[Y < -scale] = -scale
-                return Y
+            def proxg(y): return project1D(y, scale)
         else:
             translation = translation.reshape(-1)
 
@@ -1686,19 +1770,12 @@ class L1(proxFunc):
             def setproxg(t): self.__proxgparam = translation * t
 
             def proxf(x):
-                t = self.__proxfparam
                 X = x - translation
-                indPos, indNeg = x > t, x < -t
-                X[indPos] -= t
-                X[indNeg] += t
-                X[np.logical_not(np.logical_or(indPos, indNeg))] = 0
-                return X + translation
+                shrink1D(X, self.__proxfparam, out=X)
+                X += translation
+                return X
 
-            def proxg(y):
-                Y = y - self.__proxgparam
-                Y[Y > scale] = scale
-                Y[Y < -scale] = -scale
-                return Y
+            def proxg(y): return project1D(y - self.__proxgparam, scale)
 
         def violation(x): return max(0, norm(x, np.inf) / scale - 1)
 
@@ -1749,11 +1826,7 @@ class L1_2(proxFunc):
                 n = np.maximum(0, 1 - t / n)
                 return x * n
 
-            def proxg(y):
-                y = y.reshape(self.shape)
-                out = np.empty(y.shape, dtype=y.dtype)
-                project(y, scale, out)
-                return out
+            def proxg(y): return project(y.reshape(self.shape), scale)
         else:
             translation = translation.reshape(self.shape)
 
@@ -1777,7 +1850,7 @@ class L1_2(proxFunc):
 
             def proxg(y):
                 y = y.reshape(self.shape) - self.__proxgparam
-                project(y, scale, y)
+                project(y, scale, out=y)
                 return y
 
         def violation(y):
@@ -1791,6 +1864,145 @@ class L1_2(proxFunc):
     def __vecnorm(self, x):
         x = norm(x, 2, -1, True)
         return x + 1e-8
+
+
+class WaveletL1(L1_2):
+    def __init__(self, scale=1, translation=None, wavelet='haar', mode='constant', vol_shape=None, spect_shape=1):
+        '''
+        f(x) = scale|W*(x-translation)|_1 
+             = s|W*(x-d)|_1
+        df(x) = s*W^T*sign(W*(x-d))
+        lip = hess = nan
+        prox(x,t) = argmin_X 1/2|X-x|^2 + st|W*(X-d)|
+                  = d + W^T*argmin_X 1/2|X-(x-W*d)|^2 + st|X|
+            X + (st)sign(X) = x-W*d
+            X = x-W*d -st, 0, x-W*d +st
+
+        g(y) = sup_x <y,x> - s|W*(x-d)|
+             = <y,d> if |W*y|_\infty <= s
+        dg(y) = d
+        lip = hess = nan
+        prox(y,t) = argmin 1/2|Y-y|^2 + t<Y,d> s.t. |W*Y|< s
+                  = W^T*proj_{|Y|<s}(W*(y-td))
+
+
+        '''
+        self.scale = scale
+        vol_shape = (-1,) if vol_shape is None else vol_shape
+        self.vol_shape, self.spect_shape = vol_shape, spect_shape
+        self._scalar = (spect_shape == 1 or np.prod(spect_shape.shape) == 1)
+        self.shape = tuple(vol_shape) + (() if self._scalar else np.prod(spect_shape))
+        assert np.prod(self.vol_shape) != -1 or np.prod(self.spect_shape) != -1
+        self.size = np.prod(self.shape)
+
+        if wavelet in (None, 'None', 'none'):  # No wavelet, fwrd/bwrd are identity
+            self.wavelet = None, mode
+
+            def _fwrd(x, listify=False): return [x.reshape(self.shape)]
+            def _bwrd(x): return x[0]
+
+        else:
+            if not np.isclose(2 ** np.log2(vol_shape).round(), vol_shape).all():
+                raise ValueError(
+                    'Volume dimensions must be exact powers of 2 \nfor wavelet implementation to behave as expected.')
+            import pywt
+            self.wavelet = pywt.Wavelet(wavelet), mode
+            assert self.wavelet[0].orthogonal
+
+            def _fwrd(x, listify=False):
+                if self._scalar:  # scalar data
+                    out = pywt.wavedecn(x.reshape(self.vol_shape), *self.wavelet)
+                else:  # spectral data
+                    out = pywt.wavedecn(x.reshape(*self.vol_shape, -1), *self.wavelet, axes=range(len(vol_shape)))
+                return self.listify(out) if listify else out
+
+            def _bwrd(y):
+                if self._scalar:  # non-spectral
+                    return pywt.waverecn(y, *self.wavelet)
+                else:  # spectral
+                    return pywt.waverecn(y, *self.wavelet, axes=range(len(vol_shape)))
+
+        self.fwrd, self.bwrd = _fwrd, _bwrd
+
+        if translation is None:
+            def f(x):
+                w = self.fwrd(x, listify=True)
+                if self._scalar:  # non-spectral data
+                    return self.scale * sum(norm(ww.ravel(), 1) for ww in w)
+                else:
+                    return self.scale * sum(self.__vecnorm(ww.reshape(-1, self.shape[-1])) for ww in w)
+
+            def g(_): return 0
+
+            def setproxf(t): self.__proxfparam = self.scale * t
+
+            def setproxg(_): self.__proxgparam = 0
+
+            def proxf(x):
+                w = self.fwrd(x)
+                if self._scalar:
+                    for ww in self.listify(w):
+#                         shrink1D(ww, self.__proxfparam, out=ww)  # inplace edit of w
+                        ww[abs(ww) <= self.__proxfparam] = 0
+                        ww[ww > self.__proxfparam] -= self.__proxfparam
+                        ww[ww < -self.__proxfparam] += self.__proxfparam
+                else:
+                    t = self.__proxfparam
+                    for ww in self.listify(w):
+                        n = self.__vecnorm(ww.reshape(-1, self.shape[-1]))
+                        ww *= np.maximum(0, 1 - t / n)  # inplace edit of w
+                return self.bwrd(w)
+
+            def proxg(y): raise NotImplementedError
+        else:
+            translation = translation.reshape(self.shape)
+
+            def f(x):
+                w = self.fwrd(x.reshape(self.shape) - translation, listify=True)
+                if self._scalar:  # non-spectral data
+                    return self.scale * sum(norm(ww.ravel(), 1) for ww in w)
+                else:
+                    return self.scale * sum(self.__vecnorm(ww.reshape(-1, self.shape[-1])) for ww in w)
+
+            def g(y): return (y.conj().reshape(self.shape) * translation).sum()
+
+            def setproxf(t): self.__proxfparam = self.scale * t
+
+            def setproxg(t): self.__proxgparam = translation * t
+
+            def proxf(x):
+                w = self.fwrd(x.reshape(self.shape) - translation)
+                if self._scalar:
+                    for ww in self.listify(w):
+                        shrink1D(ww, self.__proxfparam, out=ww)  # inplace edit of w
+                else:
+                    t = self.__proxfparam
+                    for ww in self.listify(w):
+                        n = self.__vecnorm(ww.reshape(-1, self.shape[-1]))
+                        ww *= np.maximum(0, 1 - t / n)  # inplace edit of w
+
+                return self.bwrd(w) + translation
+
+            def proxg(y): raise NotImplementedError
+
+        def violation(y):
+            w = self.listify(y)
+            if self._scalar:
+                n, inf = abs(w[0]).max(), float('inf')
+                for ww in w[1:]:
+                    n = max(n, norm(ww.ravel(), inf, axis=1))
+            else:
+                n = norm(w[0].reshape(-1, self.shape[-1]), 2, axis=1).max()
+                for ww in w[1:]:
+                    n = max(n, norm(ww.reshape(-1, self.shape[-1]), 2, axis=1).max())
+            return max(0, n / self.scale - 1)
+
+        proxFunc.__init__(self, f, prox=proxf, setprox=setproxf)
+        dual = proxFunc(g, prox=proxg, setprox=setproxg, violation=violation)
+        dualableFunc(self, dual)
+
+    # utility mapping wavelet coefficients to a list of arrays
+    def listify(self, w): return sum((list(ww.values()) for ww in w[1:]), [w[0]])
 
 
 class PDHG(tomo_iter_alg):
@@ -1858,7 +2070,7 @@ class PDHG(tomo_iter_alg):
             sigma, tau = self.s, self.t
         else:
             balance = 1 if balance is None else balance
-            normA = poweriter(self.A) if normA is None else normA
+            normA = 1.01 * poweriter(self.A) if normA is None else normA
             sigma, tau = balance / normA, 1 / (balance * normA)
         self.s, self.t = sigma, tau
         self.f.setprox(self.s)
@@ -1913,7 +2125,6 @@ class PDHG(tomo_iter_alg):
 
             # Dual step:
             tmp = self.y
-            tmp2 = self.y + self.s * (2 * self.Ax - self.Axm1)
             self.y = self.g.prox(self.y + self.s * (2 * self.Ax - self.Axm1))
             self.ym1, self.Aym1 = tmp, self.Ay
             self.Ay = self.A.T * self.y
@@ -2189,6 +2400,238 @@ class TGV(PDHG):
         return self.x[0].reshape(self.d1.vol_shape) * self.dataScale
 
 
+class FISTA(tomo_iter_alg):
+    '''
+    The classical implementation of the FISTA method as proposed in
+        @article{beck2009fast,
+          title={A fast iterative shrinkage-thresholding algorithm for linear inverse problems},
+          author={Beck, Amir and Teboulle, Marc},
+          journal={SIAM Journal on Imaging Sciences},
+          volume={2},
+          number={1},
+          pages={183--202},
+          year={2009},
+          publisher={SIAM}
+        }
+    with more modern variants:
+        @article{liang2018improving,
+          title={Improving "Fast Iterative Shrinkage-Thresholding Algorithm": Faster, Smarter and Greedier},
+          author={Liang, Jingwei and Luo, Tao and Sch{\"o}nlieb, Carola-Bibiane},
+          journal={arXiv preprint arXiv:1811.01430},
+          year={2018}
+        }
+    '''
+    def __init__(self, f, g, op=None):
+        '''
+        Compute minimisers of:
+         f(x) + g(x)
+        '''
+        tomo_iter_alg.__init__(self, op)
+        self.f, self.g = f, g
+        self.x = self.t = self.tol = self.restarting = None
+
+    def setParams(self, f=None, g=None, x=None, tol=None,
+                  steps=None, restarting=None, stepParams={}, **_):
+        # Reset problem
+        if f is not None:
+            self.f = f
+        if g is not None:
+            self.g = g
+
+        # Set starting point
+        if x is not None:
+            self.x, self.xm1 = x, x
+
+        # tau is initial step size, maybe in the future implement backtracking
+        self.t = 1 / self.f.Lip
+        self.g.setprox(self.t)
+
+        # Set adaptive step criterion
+        if steps[0].lower() == 'c':  # classic Chambolle-Dossal choice
+            self._inertia, self._stepsize = self._classic(**stepParams)
+        elif steps[0].lower() == 's':  # strong convexity
+            self._inertia, self._stepsize = self._strong(**stepParams)
+        elif steps[0].lower() == 'g':  # greedy
+            self._inertia, self._stepsize = self._greedy(**stepParams)
+        else:
+            raise ValueError('steps must be classic, strong, or greedy.')
+
+        # Set tolerance
+        if tol is not None:
+            self.tol = tol
+        elif self.tol is None:
+            self.tol = 1e-8
+
+        if restarting is not None:
+            self.restarting = restarting
+        elif self.restarting is None:
+            self.restarting = True
+
+    def start(self, x=None, **kwargs):
+        # Choose starting point:
+        if (x is None) and (self.x is None):
+            x = getVec(self.op, rand=False)
+
+        self.setParams(x=x, **kwargs)
+        self.counter = 0
+
+    def step(self, i, niter):
+        for _ in range(niter):
+            # Inertial step:
+            a = self._inertia(self)
+            if a == 0:
+                y = self.x
+            elif a == 1:
+                y = 2 * self.x - self.xm1
+            else:
+                y = (1 + a) * self.x - a * self.xm1
+            self.x, self.xm1 = self.g.prox(y - self.t * self.f.grad(y)), self.x
+#             self.x, self.xm1 = y - self.t * self.f.grad(y), self.x
+
+#             Check for restarting:
+            if self.restarting and vecIP(y - self.x, self.x - self.xm1) >= 0:
+                self.x = self.g.prox(self.xm1 - self.t * self.f.grad(self.xm1))
+                self.counter = 0
+                continue
+
+            # Check step size:
+            if self._stepsize(self):
+                self.g.setprox(self.t)
+
+            self.counter += 1  # increment counter
+
+    def _classic(self, d=20):
+        self.stepParams = {'d':d}
+
+        def inertia(alg): return alg.counter / (alg.counter + alg.stepParams['d'])
+        def stepsize(alg): False
+
+        return inertia, stepsize
+
+    def _strong(self, convexity=1):  # coefficient of strong convexity
+        self.stepParams = {'convexity':convexity}
+
+        def inertia(alg):
+            return max(0, (1 - (alg.t * alg.stepParams['convexity']) ** .5) /
+                                (1 + (alg.t * alg.stepParams['convexity']) ** .5))
+        def stepsize(alg): False
+
+        return inertia, stepsize
+
+    def _greedy(self, xi=0.96, eta=1.3, s=1):
+        self.stepParams = {'xi': xi, 'eta':eta, 's': s, 't0': self.t}
+        self.t = eta * self.t  # start with a larger t value
+        self.g.setprox(self.t)
+
+        self.__greedynorm = 0
+
+        def inertia(alg): return 1
+        def stepsize(alg):
+            norm = vecNorm(alg.x - alg.xm1)
+            if self.__greedynorm == 0:
+                self.__greedynorm = self.stepParams['s'] * norm
+                return False
+            elif norm <= self.__greedynorm:
+                return False
+            else:
+                self.t = max(self.t * self.stepParams['xi'], self.stepParams['t0'])
+                return True
+
+        return inertia, stepsize
+
+    def callback(self, names):
+        for n in names:
+            if n == 'primal':
+                yield self._prim
+            elif n == 'violation':
+                yield self._violation
+            elif n == 'step':
+                yield self._step
+            elif n == 'gap':
+                yield self._gap
+
+    @property
+    def _prim(self): return self.f(self.x) + self.g(self.x)
+
+    @property
+    def _step(self): return vecNorm(self.x - self.xm1) / (1e-8 + vecNorm(self.x))
+
+    @property
+    def _violation(self): return self.f.violation(self.x) + self.g.violation(self.x)
+
+    def getRecon(self): return self.x
+
+
+class Wavelet(FISTA):
+    def __init__(self, shape, wavelet='haar', mode='constant',
+                 op=None, weight=0.1):
+        '''
+        Minimise the energy:
+        1/2|op(u)-data|^2 + weight*|W*u|_1
+        where:
+            shape: the shape of the output, u
+            wavelet='haar': name of wavelet type (e.g. haar, db1, db2,...), or None for W=identity
+            op=None: if provided, the X-ray projector to use
+            weight=0.1: float between 0 and 1
+        '''
+        FISTA.__init__(self, None, None, op=op)
+
+        self.weight, self.vol_shape = weight, shape
+        self.wavelet, self.mode = wavelet, mode
+        self.data = None
+
+    def setParams(self, data, op=None, x=None, **kwargs):
+        if op is not None:
+            self.op = op
+        elif self.op is None:
+            self.op = data.getOperator(vol_shape=self.vol_shape, **kwargs)
+
+        R = self.op
+        normR = [R.dot((getVec(R) + 1)), R.T.dot(getVec(R.T) + 1)]
+        normR += [R.T.dot(normR[0]), R.dot(normR[1])]
+        normR = [n.max() ** .5 for n in normR]
+        normR = min(normR[0] * normR[1], *normR[2:])
+
+        self.weight = kwargs.get('weight', self.weight)
+        g = WaveletL1(scale=self.weight, wavelet=self.wavelet, mode=self.mode, vol_shape=self.vol_shape)
+
+        self.dataScale = max(max(abs(w).max() for w in g.fwrd(R.T.dot(data.ravel()), listify=True)), 1e-6)
+#         print(self.dataScale / R.T.dot(data.ravel()).max())
+#         exit()
+#         self.dataScale = max((R.T * data.ravel()).max(), 1e-6)
+
+        self.data = data  # pre-scaled
+        f = L2fidelity(scale=1, A=R, normA=normR, translation=data.__array__() / self.dataScale)
+
+        # Choose starting point:
+        if x is None:
+            x = getVec(R, rand=False)
+
+        if 'steps' not in kwargs:
+            kwargs['steps'] = 'greedy'
+
+        FISTA.setParams(self, f=f, g=g, x=x, **kwargs)
+
+    def start(self, data=None, x=None, **kwargs):
+        if data is None:
+            if self.data is None:
+                raise ValueError('data must be provided')
+            else:
+                data = self.data
+
+        self.setParams(data=data, x=x, **kwargs)
+        self.counter = 0
+
+    @property
+    def _gap(self):
+        dF = self.g.fwrd(self.f.grad(self.x), listify=True)
+        X = self.g.fwrd(self.x, listify=True)
+        return max(L1_gap(df.ravel(), x.ravel(), self.g.scale) for df, x in zip(dF, X))
+
+    def getRecon(self): return self.x.reshape(self.vol_shape) * self.dataScale
+
+
+cleanup_astra()
 if __name__ == '__main__':
     from skimage.data import moon, binary_blobs
     from matplotlib import pyplot as plt
@@ -2210,8 +2653,10 @@ if __name__ == '__main__':
                             angles, degrees=False, geom='parallel',
                             tilt_axis=0, stack_dim=1)
 
+#     Xray2 = tomo_data2d.getOperator(
+#         vol_shape=data2d.shape, backend='skimage', interpolation='linear')
     Xray2 = tomo_data2d.getOperator(
-        vol_shape=data2d.shape, backend='skimage', interpolation='linear')
+        vol_shape=data2d.shape, backend='astra', GPU=True)
     Xray3 = tomo_data3d.getOperator(
         vol_shape=data3d.shape, backend='astra', GPU=True)
 
@@ -2264,17 +2709,23 @@ if __name__ == '__main__':
 #     rec3d = TGV(vol3d).run(data=sino3d, balance=1, maxiter=100, weight=0.01,
 # callback=('gap', 'primal', 'dual', 'violation', 'step'))[0]
 
+    # Haar wavelet reconstruction
+#     rec2d = Wavelet(vol2d, wavelet='db4').run(data=sino2d, maxiter=100, weight=1e-4,
+#                           callback=('primal', 'gap', 'step'))[0]
+#     rec3d = Wavelet(vol3d).run(data=sino3d, maxiter=100, weight=1e-4,
+#                           callback=('primal', 'gap', 'step'))[0]
+
     plt.figure('2D Data')
     plt.subplot(221); plt.imshow(data2d); plt.title('data')
     plt.subplot(222); plt.imshow(sino2d, aspect='auto'); plt.title('Sinogram')
     plt.subplot(223); plt.imshow(bp2d); plt.title('Back-projection')
-    plt.subplot(224); plt.imshow(rec2d); plt.title('Reconstruction')
+    plt.subplot(224); plt.imshow(rec2d, vmin=0, vmax=data2d.max()); plt.title('Reconstruction')
 
     half = int(vol3d[0] / 2)
     plt.figure('3D Data')
     plt.subplot(221); plt.imshow(data3d[half]); plt.title('Slice of data')
     plt.subplot(222); plt.imshow(sino3d[:, 90,:]); plt.title('Single projection')
     plt.subplot(223); plt.imshow(bp3d[half]); plt.title('2D slice of back projection')
-    plt.subplot(224); plt.imshow(rec3d[half]); plt.title('2D slice of Reconstruction')
+    plt.subplot(224); plt.imshow(rec3d[half], vmin=0, vmax=data3d[half].max()); plt.title('2D slice of Reconstruction')
 
     plt.show()

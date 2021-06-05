@@ -15,8 +15,7 @@ def test_compile():
     def norm(x): return (x ** 2).sum(-1) ** .5
     for d in range(1, 4):
         x = np.random.rand(10, d)
-        y = x.copy()
-        rtr.project(x, .5, y)
+        y = rtr.project(x, .5)
         x, y = norm(x), norm(y)
         ind = x < .5
         np.testing.assert_allclose(y[ind], x[ind], 1e-10, 1e-10)
@@ -24,8 +23,7 @@ def test_compile():
 
         # test symmetric projection
         A = np.random.rand(10, d, d)
-        B = A.copy()
-        rtr.sym(A, B)
+        B = rtr.sym(A)
         np.testing.assert_allclose(A + np.transpose(A, (0, 2, 1)), 2 * B, 1e-10, 1e-10)
 
 
@@ -96,7 +94,7 @@ def get_data(vol, angles):
 
 @pytest.mark.parametrize('dim', (2, 3))
 def test_null_reconstruction(dim):
-    shape = [10] * dim  # volume shape
+    shape = [16] * dim  # volume shape
     angles = np.linspace(0, np.pi, 9)  # detector angles
 
     data = get_data(shape, angles)
@@ -108,7 +106,12 @@ def test_null_reconstruction(dim):
         recon = alg.run(data=data, op=Xray)
         np.testing.assert_allclose(recon, 0, 1e-6, 1e-6)
 
-    for alg in (rtr.TV(shape, order=1, weight=.9), rtr.TV(shape, order=2, weight=.9),
+    for alg in (rtr.Wavelet(shape, weight=.9), rtr.Wavelet(shape, weight=.9, wavelet=None), rtr.Wavelet(shape, weight=.9, wavelet='None')):
+        alg.setParams(data=data, op=Xray)
+        recon = alg.run(maxiter=10, x=rtr.getVec(Xray, rand=True))
+        np.testing.assert_allclose(recon, 0, 1e-6, 1e-6)
+
+    for alg in (rtr.TV(shape, order=0, weight=.9), rtr.TV(shape, order=1, weight=.9), rtr.TV(shape, order=2, weight=.9),
                 rtr.TGV(shape, weight=.9)):
         alg.setParams(data=data, op=Xray)
         recon = alg.run(maxiter=10, x=rtr.getVec(alg.A, rand=True), y=rtr.getVec(alg.A.T, rand=True))
